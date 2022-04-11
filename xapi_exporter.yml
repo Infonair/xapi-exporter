@@ -1,0 +1,11 @@
+bindaddress: ":9290"
+namespace: "xenstats"
+timeoutlogin: 15
+
+pools:
+  "xen-pool-a":
+  - "172.16.10.44"
+
+auth:
+  username: "root"
+  password: "Infonair99"

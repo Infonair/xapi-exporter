@@ -1,0 +1,12 @@
+FROM alpine:latest
+
+RUN apk add --update go git
+
+ENV GOPATH /go
+ENV CGO_ENABLED=0
+
+ADD . /go/src/github.com/johnprather/xapi_exporter
+RUN go get -d github.com/johnprather/xapi_exporter
+RUN go build -o /bin/xapi_exporter github.com/johnprather/xapi_exporter
+
+CMD /bin/cat
