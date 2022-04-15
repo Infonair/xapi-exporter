@@ -4,14 +4,6 @@
 # and then install it into a more space-conscious container
 #
 
-if [ -z "${1}" ]
-then
-  echo "This script takes one argument: the tag name for the final container"
-  echo ""
-  echo "Example: ${0} xapi_exporter"
-  exit 1
-fi
-
 docker build -t xapi_exporter_staticbuild -f Dockerfile.build .
 
 CONTAINER_ID=`docker run -d -t xapi_exporter_staticbuild`
@@ -56,7 +48,7 @@ then
   exit 1
 fi
 
-docker build -t "${1}" -f Dockerfile.run .
+docker build -t "xapi" -f Dockerfile.run .
 if [ $? != 0 ]
 then
   echo "Failed to build run image" >&2

@@ -1,15 +1,16 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
-	"net"
+	//"net"
 	"os"
 	"strconv"
 	"strings"
 	"time"
-
-	xenAPI "github.com/terra-farm/go-xen-api-client"
+	list "container/list"
+	xenAPI "github.com/Infonair/go-xen-api-client"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -25,6 +26,13 @@ type poolGathererClass struct {
 	poolName        string
 	lastKnownMaster string
 	xenClients      map[string]*xenAPI.Client
+}
+
+type xenClientClass struct {
+	xenClient *xenAPI.Client
+	session xenAPI.SessionRef
+	host string
+	err error
 }
 
 func newExporter() *exporterClass {
@@ -125,258 +133,269 @@ func (g *poolGathererClass) gather(retCh chan []*prometheus.GaugeVec) {
 
 	timeStarted := time.Now().Unix()
 
-	xenClient, session, err := g.getXenClient()
-	if err != nil {
-		log.Printf("Error getting XAPI client for %s: %s\n", g.poolName, err.Error())
-		return
-	}
+	clients := g.getXenClient()
+	for e := clients.Front(); e != nil; e = e.Next() {
+		cl := xenClientClass(e.Value.(xenClientClass))
+		xenClient := cl.xenClient
+		session := cl.session
+		ip := cl.host
+		err := cl.err
+		if err != nil {
+			log.Printf("Error getting XAPI client for %s: %s\n", g.poolName, err.Error())
+			continue
+		}
 
-	timeConnected := time.Now().Unix()
-	log.Printf("gatherPoolData(): %s: session established in %d seconds\n",
-		g.poolName, timeConnected-timeStarted)
+		timeConnected := time.Now().Unix()
+		log.Printf("gatherPoolData(): %s: session established in %d seconds\n",
+			g.poolName, timeConnected-timeStarted)
+/*
+		poolRecs, err := xenClient.Pool.GetAllRecords(session)
+		if err != nil {
+			log.Printf("Error getting pool records for %s: %s", g.poolName, err.Error())
+			continue
+		}
+*/
+		hostRecs, err := xenClient.Host.GetAllRecords(session)
+		if err != nil {
+			log.Printf("Error getting host records for %s: %s\n", g.poolName, err.Error())
+			continue
+		}
 
-	poolRecs, err := xenClient.Pool.GetAllRecords(session)
-	if err != nil {
-		log.Printf("Error getting pool records for %s: %s", g.poolName, err.Error())
-		return
-	}
+		vmRecs, err := xenClient.VM.GetAllRecords(session)
+		if err != nil {
+			log.Printf("Error getting vm records for %s: %s\n", g.poolName, err.Error())
+			continue
+		}
+		vmMetricsRecs, err := xenClient.VMMetrics.GetAllRecords(session)
+		if err != nil {
+			log.Printf("Error getting vm metrics records for %s: %s\n", g.poolName, err.Error())
+			continue
+		}
 
-	hostRecs, err := xenClient.Host.GetAllRecords(session)
-	if err != nil {
-		log.Printf("Error getting host records for %s: %s\n", g.poolName, err.Error())
-		return
-	}
-
-	vmRecs, err := xenClient.VM.GetAllRecords(session)
-	if err != nil {
-		log.Printf("Error getting vm records for %s: %s\n", g.poolName, err.Error())
-		return
-	}
-
-	vmMetricsRecs, err := xenClient.VMMetrics.GetAllRecords(session)
-	if err != nil {
-		log.Printf("Error getting vm metrics records for %s: %s\n", g.poolName, err.Error())
-		return
-	}
-
-	hostMetricsRecs, err := xenClient.HostMetrics.GetAllRecords(session)
-	if err != nil {
-		log.Printf("Error getting host metrics records for %s: %s\n", g.poolName, err.Error())
-		return
-	}
-
-	srRecs, err := xenClient.SR.GetAllRecords(session)
-	if err != nil {
-		log.Printf("Error getting sr records for %s: %s", g.poolName, err.Error())
-		return
-	}
-
-	for _, hostRec := range hostRecs {
-		// tally vcpus and vms
-		vCPUCount := 0
-		vmCount := 0
-		for _, vmRef := range hostRec.ResidentVMs {
-			if vmRec, ok := vmRecs[vmRef]; ok && !vmRec.IsControlDomain {
-				vmCount++
-				if vmMetricsRec, ok := vmMetricsRecs[vmRec.Metrics]; ok {
-					vCPUCount += vmMetricsRec.VCPUsNumber
+		hostMetricsRecs, err := xenClient.HostMetrics.GetAllRecords(session)
+		if err != nil {
+			log.Printf("Error getting host metrics records for %s: %s\n", g.poolName, err.Error())
+			continue
+		}
+		srRecs, err := xenClient.SR.GetAllRecords(session)
+		if err != nil {
+			log.Printf("Error getting sr records for %s: %s", g.poolName, err.Error())
+			continue
+		}
+		b, err := json.Marshal(vmRecs)
+		if err != nil {
+			fmt.Println(err)
+		}
+		fmt.Println(string(b))
+		var hostName = ""
+		for _, hostRec := range hostRecs {
+			hostName = hostRec.Hostname
+			// tally vcpus and vms
+			vCPUCount := 0
+			vmCount := 0
+			for _, vmRef := range hostRec.ResidentVMs {
+				if vmRec, ok := vmRecs[vmRef]; ok && !vmRec.IsControlDomain {
+					vmCount++
+					if vmMetricsRec, ok := vmMetricsRecs[vmRec.Metrics]; ok {
+						vCPUCount += vmMetricsRec.VCPUsNumber
+					}
 				}
 			}
-		}
 
-		cpuCount, _ := strconv.ParseFloat(hostRec.CPUInfo["cpu_count"], 64)
+			cpuCount, _ := strconv.ParseFloat(hostRec.CPUInfo["cpu_count"], 64)
+			// set cpu_count metric for the host
+			if metricEnabled("cpu_count") {
+				cpuCountMetric := newMetric("cpu_count",
+					map[string]string{"host": hostName, "ip": ip},
+					cpuCount)
+				metricList = append(metricList, cpuCountMetric)
+			}
 
-		// set cpu_count metric for the host
-		if metricEnabled("cpu_count") {
-			cpuCountMetric := newMetric("cpu_count",
-				map[string]string{"host": hostRec.Hostname},
-				cpuCount)
-			metricList = append(metricList, cpuCountMetric)
-		}
+			// set cpu_allocation metric for the host
+			if metricEnabled("cpu_allocation") {
+				cpuAllocationMetric := newMetric("cpu_allocation",
+					map[string]string{"host": hostName},
+					float64(vCPUCount)*100/cpuCount)
+				metricList = append(metricList, cpuAllocationMetric)
+			}
 
-		// set cpu_allocation metric for the host
-		if metricEnabled("cpu_allocation") {
-			cpuAllocationMetric := newMetric("cpu_allocation",
-				map[string]string{"host": hostRec.Hostname},
-				float64(vCPUCount)*100/cpuCount)
-			metricList = append(metricList, cpuAllocationMetric)
-		}
+			// set memory_total metric for host
+			if metricEnabled("memory_total") {
+				memoryTotalMetric := newMetric("memory_total",
+					map[string]string{"host": hostName},
+					float64(hostMetricsRecs[hostRec.Metrics].MemoryTotal))
+				metricList = append(metricList, memoryTotalMetric)
+			}
 
-		// set memory_total metric for host
-		if metricEnabled("memory_total") {
-			memoryTotalMetric := newMetric("memory_total",
-				map[string]string{"host": hostRec.Hostname},
-				float64(hostMetricsRecs[hostRec.Metrics].MemoryTotal))
-			metricList = append(metricList, memoryTotalMetric)
-		}
+			// set memory_free metric for host
+			if metricEnabled("memory_free") {
+				memoryFreeMetric := newMetric("memory_free",
+					map[string]string{"host": hostName},
+					float64(hostMetricsRecs[hostRec.Metrics].MemoryFree))
+				metricList = append(metricList, memoryFreeMetric)
+			}
 
-		// set memory_free metric for host
-		if metricEnabled("memory_free") {
-			memoryFreeMetric := newMetric("memory_free",
-				map[string]string{"host": hostRec.Hostname},
-				float64(hostMetricsRecs[hostRec.Metrics].MemoryFree))
-			metricList = append(metricList, memoryFreeMetric)
-		}
+			// set memory_allocation metric for host
+			if metricEnabled("memory_allocation") {
+				hostMetricsRec := hostMetricsRecs[hostRec.Metrics]
+				memoryAllocationMetric := newMetric("memory_allocation",
+					map[string]string{"host": hostName},
+					float64(hostMetricsRec.MemoryTotal-hostMetricsRec.MemoryFree)*100/
+						float64(hostMetricsRec.MemoryTotal))
+				metricList = append(metricList, memoryAllocationMetric)
+			}
 
-		// set memory_allocation metric for host
-		if metricEnabled("memory_allocation") {
-			hostMetricsRec := hostMetricsRecs[hostRec.Metrics]
-			memoryAllocationMetric := newMetric("memory_allocation",
-				map[string]string{"host": hostRec.Hostname},
-				float64(hostMetricsRec.MemoryTotal-hostMetricsRec.MemoryFree)*100/
-					float64(hostMetricsRec.MemoryTotal))
-			metricList = append(metricList, memoryAllocationMetric)
-		}
+			// set resident_vcpu_count metric for host
+			if metricEnabled("resident_vcpu_count") {
+				residentVCPUCountMetric := newMetric("resident_vcpu_count",
+					map[string]string{"host": hostName},
+					float64(vCPUCount))
+				metricList = append(metricList, residentVCPUCountMetric)
+			}
 
-		// set resident_vcpu_count metric for host
-		if metricEnabled("resident_vcpu_count") {
-			residentVCPUCountMetric := newMetric("resident_vcpu_count",
-				map[string]string{"host": hostRec.Hostname},
-				float64(vCPUCount))
-			metricList = append(metricList, residentVCPUCountMetric)
-		}
-
-		// set resident_vm_count metric for host
-		if metricEnabled("resident_vm_count") {
-			residentVMCountMetric := newMetric("resident_vm_count",
-				map[string]string{"host": hostRec.Hostname},
-				float64(vmCount))
-			metricList = append(metricList, residentVMCountMetric)
-		}
-	}
-
-	for _, poolRec := range poolRecs {
-		defaultSRList = append(defaultSRList, poolRec.DefaultSR)
-
-		// set ha_allow_overcommit metric for pool
-		if metricEnabled("ha_allow_overcommit") {
-			haAllowOvercommitMetric := newMetric("ha_allow_overcommit",
-				map[string]string{"pool": poolRec.NameLabel},
-				boolFloat(poolRec.HaAllowOvercommit))
-			metricList = append(metricList, haAllowOvercommitMetric)
-		}
-
-		// set ha_enabled metric for pool
-		if metricEnabled("ha_enabled") {
-			haEnabledMetric := newMetric("ha_enabled",
-				map[string]string{"pool": poolRec.NameLabel},
-				boolFloat(poolRec.HaEnabled))
-			metricList = append(metricList, haEnabledMetric)
-		}
-
-		// set ha_host_failures_to_tolerate metric for pool
-		if metricEnabled("ha_host_failures_to_tolerate") {
-			haHostFailuresToTolerateMetric := newMetric("ha_host_failures_to_tolerate",
-				map[string]string{"pool": poolRec.NameLabel},
-				float64(poolRec.HaHostFailuresToTolerate))
-			metricList = append(metricList, haHostFailuresToTolerateMetric)
-		}
-
-		// set the ha_overcommitted metric for pool
-		if metricEnabled("ha_overcommitted") {
-			haOvercommittedMetric := newMetric("ha_overcommitted",
-				map[string]string{"pool": poolRec.NameLabel},
-				boolFloat(poolRec.HaOvercommitted))
-			metricList = append(metricList, haOvercommittedMetric)
-		}
-
-		// set the wlb_enabled metric for the pool
-		if metricEnabled("wlb_enabled") {
-			wlbEnabledMetric := newMetric("wlb_enabled",
-				map[string]string{"pool": poolRec.NameLabel},
-				boolFloat(poolRec.WlbEnabled))
-			metricList = append(metricList, wlbEnabledMetric)
-		}
-
-	}
-
-	for srRef, srRec := range srRecs {
-		defaultSR := false
-		for _, defSR := range defaultSRList {
-			if defSR == srRef {
-				defaultSR = true
+			// set resident_vm_count metric for host
+			if metricEnabled("resident_vm_count") {
+				residentVMCountMetric := newMetric("resident_vm_count",
+					map[string]string{"host": hostName},
+					float64(vmCount))
+				metricList = append(metricList, residentVMCountMetric)
 			}
 		}
+		/*
+		for _, poolRec := range poolRecs {
+			defaultSRList = append(defaultSRList, poolRec.DefaultSR)
 
-		// set the default_storage metric for the sr
-		if metricEnabled("default_storage") {
-			defaultStorageMetric := newMetric("default_storage",
-				map[string]string{
-					"uuid":       srRec.UUID,
-					"pool":       g.poolName,
-					"type":       srRec.Type,
-					"name_label": srRec.NameLabel,
-				}, boolFloat(defaultSR))
-			metricList = append(metricList, defaultStorageMetric)
-		}
+			// set ha_allow_overcommit metric for pool
+			if metricEnabled("ha_allow_overcommit") {
+				haAllowOvercommitMetric := newMetric("ha_allow_overcommit",
+					map[string]string{"pool": poolRec.NameLabel},
+					boolFloat(poolRec.HaAllowOvercommit))
+				metricList = append(metricList, haAllowOvercommitMetric)
+			}
 
-		// set the physical_size metric for the sr
-		if metricEnabled("physical_size") {
-			physicalSizeMetric := newMetric("physical_size",
-				map[string]string{
-					"uuid":       srRec.UUID,
-					"pool":       g.poolName,
-					"type":       srRec.Type,
-					"name_label": srRec.NameLabel,
-				}, float64(srRec.PhysicalSize))
-			metricList = append(metricList, physicalSizeMetric)
-		}
+			// set ha_enabled metric for pool
+			if metricEnabled("ha_enabled") {
+				haEnabledMetric := newMetric("ha_enabled",
+					map[string]string{"pool": poolRec.NameLabel},
+					boolFloat(poolRec.HaEnabled))
+				metricList = append(metricList, haEnabledMetric)
+			}
 
-		// set the physical_utilisation metric for the sr
-		if metricEnabled("physical_utilisation") {
-			physicalUtilisationMetric := newMetric("physical_utilisation",
-				map[string]string{
-					"uuid":       srRec.UUID,
-					"pool":       g.poolName,
-					"type":       srRec.Type,
-					"name_label": srRec.NameLabel,
-				}, float64(srRec.PhysicalUtilisation))
-			metricList = append(metricList, physicalUtilisationMetric)
-		}
+			// set ha_host_failures_to_tolerate metric for pool
+			if metricEnabled("ha_host_failures_to_tolerate") {
+				haHostFailuresToTolerateMetric := newMetric("ha_host_failures_to_tolerate",
+					map[string]string{"pool": poolRec.NameLabel},
+					float64(poolRec.HaHostFailuresToTolerate))
+				metricList = append(metricList, haHostFailuresToTolerateMetric)
+			}
 
-		// set the physical_pct_allocated metric for the sr
-		physicalPctAllocated := float64(0)
-		if srRec.PhysicalSize > 0 {
-			physicalPctAllocated = float64(srRec.PhysicalUtilisation) * 100 /
-				float64(srRec.PhysicalSize)
-		}
-		if metricEnabled("physical_pct_allocated") {
-			physicalPctAllocatedMetric := newMetric("physical_pct_allocated",
-				map[string]string{
-					"uuid":       srRec.UUID,
-					"pool":       g.poolName,
-					"type":       srRec.Type,
-					"name_label": srRec.NameLabel,
-				}, physicalPctAllocated)
-			metricList = append(metricList, physicalPctAllocatedMetric)
-		}
+			// set the ha_overcommitted metric for pool
+			if metricEnabled("ha_overcommitted") {
+				haOvercommittedMetric := newMetric("ha_overcommitted",
+					map[string]string{"pool": poolRec.NameLabel},
+					boolFloat(poolRec.HaOvercommitted))
+				metricList = append(metricList, haOvercommittedMetric)
+			}
 
-		// set the virtual_allocation metric for the sr
-		if metricEnabled("virtual_allocation") {
-			virtualAllocationMetric := newMetric("virtual_allocation",
-				map[string]string{
-					"uuid":       srRec.UUID,
-					"pool":       g.poolName,
-					"type":       srRec.Type,
-					"name_label": srRec.NameLabel,
-				}, float64(srRec.VirtualAllocation))
-			metricList = append(metricList, virtualAllocationMetric)
-		}
+			// set the wlb_enabled metric for the pool
+			if metricEnabled("wlb_enabled") {
+				wlbEnabledMetric := newMetric("wlb_enabled",
+					map[string]string{"pool": poolRec.NameLabel},
+					boolFloat(poolRec.WlbEnabled))
+				metricList = append(metricList, wlbEnabledMetric)
+			}
 
+		}
+		*/
+		for srRef, srRec := range srRecs {
+			defaultSR := false
+			for _, defSR := range defaultSRList {
+				if defSR == srRef {
+					defaultSR = true
+				}
+			}
+
+			// set the default_storage metric for the sr
+			if metricEnabled("default_storage") {
+				defaultStorageMetric := newMetric("default_storage",
+					map[string]string{
+						"uuid":       srRec.UUID,
+						"pool":       g.poolName,
+						"type":       srRec.Type,
+						"name_label": srRec.NameLabel,
+						"host": hostName,
+					}, boolFloat(defaultSR))
+				metricList = append(metricList, defaultStorageMetric)
+			}
+
+			// set the physical_size metric for the sr
+			if metricEnabled("physical_size") {
+				physicalSizeMetric := newMetric("physical_size",
+					map[string]string{
+						"uuid":       srRec.UUID,
+						"pool":       g.poolName,
+						"type":       srRec.Type,
+						"name_label": srRec.NameLabel,
+						"host": hostName,
+					}, float64(srRec.PhysicalSize))
+				metricList = append(metricList, physicalSizeMetric)
+			}
+
+			// set the physical_utilisation metric for the sr
+			if metricEnabled("physical_utilisation") {
+				physicalUtilisationMetric := newMetric("physical_utilisation",
+					map[string]string{
+						"uuid":       srRec.UUID,
+						"pool":       g.poolName,
+						"type":       srRec.Type,
+						"name_label": srRec.NameLabel,
+						"host": hostName,
+					}, float64(srRec.PhysicalUtilisation))
+				metricList = append(metricList, physicalUtilisationMetric)
+			}
+
+			// set the physical_pct_allocated metric for the sr
+			physicalPctAllocated := float64(0)
+			if srRec.PhysicalSize > 0 {
+				physicalPctAllocated = float64(srRec.PhysicalUtilisation) * 100 /
+					float64(srRec.PhysicalSize)
+			}
+			if metricEnabled("physical_pct_allocated") {
+				physicalPctAllocatedMetric := newMetric("physical_pct_allocated",
+					map[string]string{
+						"uuid":       srRec.UUID,
+						"pool":       g.poolName,
+						"type":       srRec.Type,
+						"name_label": srRec.NameLabel,
+						"host": hostName,
+					}, physicalPctAllocated)
+				metricList = append(metricList, physicalPctAllocatedMetric)
+			}
+
+			// set the virtual_allocation metric for the sr
+			if metricEnabled("virtual_allocation") {
+				virtualAllocationMetric := newMetric("virtual_allocation",
+					map[string]string{
+						"uuid":       srRec.UUID,
+						"pool":       g.poolName,
+						"type":       srRec.Type,
+						"name_label": srRec.NameLabel,
+						"host": hostName,
+					}, float64(srRec.VirtualAllocation))
+				metricList = append(metricList, virtualAllocationMetric)
+			}
+
+		}
 	}
-
 	timeGenerated := time.Now().Unix()
 	log.Printf("gatherPoolData(): %s: gather time %d seconds\n",
 		g.poolName, timeGenerated-timeStarted)
-
 }
 
-func (g *poolGathererClass) getXenClient() (
-	xenClient *xenAPI.Client, session xenAPI.SessionRef, err error) {
+func (g *poolGathererClass) getXenClient() *list.List {
 	var hostList = config.Pools[g.poolName]
-
 	// if a lastKnownMaster exists in our host list, bump it to the top
-	if len(g.lastKnownMaster) != 0 {
+/*	if len(g.lastKnownMaster) != 0 {
 		var newHostList = []string{g.lastKnownMaster}
 
 		for key, host := range hostList {
@@ -385,7 +404,7 @@ func (g *poolGathererClass) getXenClient() (
 				break
 			}
 			var ips []net.IP
-			ips, err = net.LookupIP(host)
+			ips, err := net.LookupIP(host)
 			if err != nil {
 				ipMatch := false
 				for _, ip := range ips {
@@ -401,22 +420,22 @@ func (g *poolGathererClass) getXenClient() (
 			}
 		}
 		hostList = newHostList
-	}
-
+	}*/
+	clients := list.New()
 	for _, host := range hostList {
-		xenClient, session, err = g.tryXenClient(host)
+		xenClient, session, err := g.tryXenClient(host)
 		if err == nil {
-			return xenClient, session, nil
+			log.Printf("host: %s", host)
+			clients.PushBack(xenClientClass{xenClient, session, host, nil})
+		} else {
+			log.Printf("tryXenClient(): %s: %s\n", host, err.Error())
+			clients.PushBack(xenClientClass{nil, "", host, fmt.Errorf("%s: unable to authenticate into a master host", g.poolName)})
 		}
-		log.Printf("tryXenClient(): %s: %s\n", host, err.Error())
 	}
-
-	return nil, "", fmt.Errorf(
-		"%s: unable to authenticate into a master host", g.poolName)
+	return clients
 }
 
-func (g *poolGathererClass) tryXenClient(host string) (
-	xenClient *xenAPI.Client, session xenAPI.SessionRef, err error) {
+func (g *poolGathererClass) tryXenClient(host string) (xenClient *xenAPI.Client, session xenAPI.SessionRef, err error) {
 
 	var ok bool
 	if xenClient, ok = g.xenClients[host]; !ok {

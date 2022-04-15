@@ -1,6 +1,7 @@
 FROM prom/busybox:glibc
 
 COPY ./xapi_exporter /bin/xapi_exporter
+#RUN touch /bin/xapi_exporter
 
 EXPOSE 9290
 
